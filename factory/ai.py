@@ -1,33 +1,44 @@
 """Talks to whichever AI the user picked: Claude, OpenAI, or a free local model through Ollama.
 Every provider gets the same job: look at a few frames (+ what was said) and write a hook."""
-import json, base64, re, urllib.request, urllib.error
+import json, base64, re, time, socket, urllib.request, urllib.error
 from . import core
 
-STYLE = """You write hooks for a short-video page about {game}.
-Every reel starts with the words "{header}" on screen; you write what comes after it.
+PROMPT_VER = "v3"
 
-Good hooks (style to copy):
+STYLE = """You write scroll-stopping hooks for a viral short-video page about {game}.
+Every reel already shows "{header}" at the top; you write ONLY the continuation line below it.
+
+Examples of 9/10 viral hooks (curiosity + specific detail, casual human voice):
 - "if you wreck Brian's seaplane, he's waiting at the dock to ask what happened"
 - "an NPC climbs back into his burning car just so he can sue"
-- "you can sneak through the airport and steal a commercial plane"
-- "your neighbour stops you every single time you leave the house"
+- "there's a sunken private jet sitting wide open on the ocean floor"
+- "cops bring out a Belgian Malinois K9 in a bandana to sniff your ride"
+- "trying to lose 4 wanted stars in a neon street racer goes sideways fast"
 
-Rules:
-- Plain, casual, human English. Lowercase is fine. Max ~80 characters. No hashtags. No ALL CAPS.
-- Describe only what is actually visible in the frames or said in the transcript. Never invent features, story spoilers, news or numbers.
-- Be specific, not generic ("you can drive cars" is bad).
-- If nothing interesting happens (menus, loading screens, black frames, a talking head with no gameplay), give a low score.
+Strict rules:
+- Your hook MUST read as one smooth, complete grammatical sentence right after "{header}," (never write choppy headline fragments).
+- Casual, punchy human English. Lowercase start, no period at the end. Max ~75 characters. No hashtags, no quotes around the whole hook, no ALL CAPS.
+- NEVER write boring literal descriptions like "a red car drives past a billboard", "a car speeds down the road", or "someone says something". Name the specific twist, chaos, chase, NPC reaction, stunt, or discovery.
+- Auto-transcripts come from noisy gameplay and can contain misheard gibberish: NEVER quote garbled or nonsensical words, and remember speech comes from human characters/players, never animals.
+- Ground every claim in what is actually visible in the frames or clearly spoken. Never invent fake lore or features.
+
+Scoring rubric (be picky so weak filler is filtered out):
+- 1-4: Routine cruising/driving with no incident, menus, map, loading, black frames, or generic walking.
+- 5-6: Mild dialogue or standard gameplay without a memorable hook.
+- 7-8: Active police chase/wanted stars, crash, shootout, funny NPC interaction, underwater/aircraft moment, or cool Vice City detail.
+- 9-10: Instant scroll-stopper — absurd physics, wild stunt/explosion, hilarious NPC/streamer reaction, or hidden world detail.
 """
 
-ASK = """These are {n} frames from a {secs}-second clip (timestamps in yellow), in order.
+ASK = """These are {n} frames from a {secs}-second {game} clip (relative clip seconds 0s..{secs}s in yellow), in chronological order.
 {transcript}
-Reply with JSON only, no prose:
-{{"score": <1-10, how likely this clip is to make people stop scrolling>,
-  "hook": "<text that comes after '{header}'>",
-  "emoji": "<one emoji that fits, or empty>",
+Inspect HUD details (wanted stars top-right, red/blue police radar, subtitles) and action across the frames.
+Reply with JSON only, no markdown or prose:
+{{"score": <1-10 using the rubric>,
+  "hook": "<scroll-stopping continuation after '{header}', max 78 chars>",
+  "emoji": "<one fitting emoji, or empty>",
   "keywords": ["<3 to 5 search phrases like 'gta 6 police chase'>"],
-  "best_start": <seconds into this clip where the good part starts, 0 if from the start>,
-  "why": "<one short line>"}}"""
+  "best_start": <0 to {secs}: relative second inside THIS clip where the action starts, 0 if right away>,
+  "why": "<one short reason>"}}"""
 
 class AIError(RuntimeError): pass
 
@@ -40,18 +51,51 @@ def _post(url, headers, body, timeout=120):
         raise AIError(f"HTTP {e.code}: {e.read().decode(errors='replace')[:400]}")
     except urllib.error.URLError as e:
         raise AIError(f"couldn't reach the AI service ({e.reason})")
+    except (TimeoutError, socket.timeout, json.JSONDecodeError, OSError) as e:
+        raise AIError(f"AI connection/response error: {e}")
 
 def _get(url, headers, timeout=20):
     req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode())
 
-def ollama_ok():
+_ollama_cache = (0.0, None)
+
+def ollama_ok(ttl=15.0):
+    global _ollama_cache
+    now = time.monotonic()
+    if now - _ollama_cache[0] < ttl:
+        return _ollama_cache[1]
     try:
-        tags = _get("http://127.0.0.1:11434/api/tags", {}, timeout=3)
-        return [m["name"] for m in tags.get("models", [])]
+        tags = _get("http://127.0.0.1:11434/api/tags", {}, timeout=2)
+        res = [m["name"] for m in tags.get("models", [])]
     except Exception:
-        return None
+        res = None
+    _ollama_cache = (now, res)
+    return res
+
+def pick_ollama_model(s):
+    want = s.get("ollama_model") or "qwen2.5vl:7b"
+    models = ollama_ok() or []
+    if want in models:
+        return want
+    hit = next((m for m in models if m.startswith(want.split(":")[0])), None)
+    if hit:
+        return hit
+    for pref in ("qwen2.5vl", "qwen3-vl", "gemma3", "llava", "minicpm-v"):
+        hit = next((m for m in models if m.startswith(pref)), None)
+        if hit:
+            return hit
+    return models[0] if models else want
+
+def unload_ollama(model):
+    """Frees Ollama VRAM before running another local model (e.g. MLX Whisper)."""
+    if not model:
+        return
+    try:
+        _post("http://127.0.0.1:11434/api/generate", {}, {"model": model, "keep_alive": 0}, timeout=5)
+    except Exception:
+        pass
 
 def pick_provider(s):
     """auto = Claude key if present, else OpenAI key, else Ollama if running, else none."""
@@ -63,13 +107,38 @@ def pick_provider(s):
     return "none"
 
 def _parse(text):
-    m = re.search(r"\{.*\}", text or "", re.S)
-    if not m: raise AIError("the AI didn't return JSON")
-    d = json.loads(m.group(0))
-    d["score"] = float(d.get("score") or 0)
-    d["hook"] = re.sub(r"^\s*(in gta vi|in gta 6)[, ]*", "", str(d.get("hook") or "").strip(), flags=re.I).strip(' "')
-    d["keywords"] = [str(k) for k in (d.get("keywords") or [])][:5]
-    d["best_start"] = float(d.get("best_start") or 0)
+    raw = text or ""
+    d = None
+    for m in re.finditer(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", raw, re.S):
+        chunk = re.sub(r",\s*([}\]])", r"\1", m.group(0))
+        try:
+            cand = json.loads(chunk)
+            if isinstance(cand, dict) and ("hook" in cand or "score" in cand):
+                d = cand
+                break
+        except json.JSONDecodeError:
+            continue
+    if d is None:
+        m = re.search(r"\{.*\}", raw, re.S)
+        if not m: raise AIError("the AI didn't return JSON")
+        try:
+            d = json.loads(re.sub(r",\s*([}\]])", r"\1", m.group(0)))
+        except json.JSONDecodeError as e:
+            raise AIError(f"invalid JSON from AI: {e}")
+    try:
+        d["score"] = float(d.get("score") or 0)
+    except (TypeError, ValueError):
+        d["score"] = 0.0
+    hook = re.sub(r"^\s*(in gta vi|in gta 6)[, :\-]*", "", str(d.get("hook") or "").strip(), flags=re.I).strip(' "').rstrip(".")
+    if len(hook) > 105:
+        hook = hook[:102].rsplit(" ", 1)[0].rstrip(" ,.-")
+    d["hook"] = hook
+    kw = d.get("keywords")
+    d["keywords"] = [str(k) for k in (kw if isinstance(kw, list) else [])][:5]
+    try:
+        d["best_start"] = float(d.get("best_start") or 0)
+    except (TypeError, ValueError):
+        d["best_start"] = 0.0
     return d
 
 def describe(image_jpg, transcript, secs, s, provider=None):
@@ -77,7 +146,7 @@ def describe(image_jpg, transcript, secs, s, provider=None):
     provider = provider or pick_provider(s)
     system = STYLE.format(game=s["game"], header=s["header"])
     t = f'What is said in the clip: "{transcript.strip()[:900]}"' if transcript and transcript.strip() else "There is no transcript."
-    user = ASK.format(n=6, secs=int(secs), transcript=t, header=s["header"])
+    user = ASK.format(n=6, secs=int(secs), transcript=t, header=s["header"], game=s["game"])
     b64 = base64.b64encode(image_jpg).decode()
 
     if provider == "claude":
@@ -103,10 +172,12 @@ def describe(image_jpg, transcript, secs, s, provider=None):
         return _parse(r["choices"][0]["message"]["content"])
 
     if provider == "ollama":
+        model = pick_ollama_model(s)
         r = _post("http://127.0.0.1:11434/api/chat", {},
-                  {"model": s.get("ollama_model"), "stream": False, "format": "json",
+                  {"model": model, "stream": False, "format": "json", "keep_alive": "15m",
+                   "options": {"temperature": 0.3, "num_ctx": 3072, "num_predict": 260},
                    "messages": [{"role": "system", "content": system},
-                                {"role": "user", "content": user, "images": [b64]}]}, timeout=600)
+                                {"role": "user", "content": user, "images": [b64]}]}, timeout=300)
         return _parse(r.get("message", {}).get("content", ""))
 
     raise AIError("no AI set up")
@@ -121,7 +192,7 @@ def test(provider, s):
             _get("https://api.openai.com/v1/models", {"Authorization": f"Bearer {core.get_key('openai_api_key')}"})
             return True, "OpenAI key works."
         if provider == "ollama":
-            models = ollama_ok()
+            models = ollama_ok(ttl=0)
             if models is None: return False, "Ollama isn't running. Open the Ollama app, then try again."
             want = s.get("ollama_model")
             if not any(m.startswith(want.split(":")[0]) for m in models):

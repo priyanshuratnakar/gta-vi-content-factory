@@ -3,7 +3,9 @@ import threading, time, uuid, traceback
 from . import core
 
 JOBS = {}
-_queue_lock = threading.Lock()   # serialises heavy work (downloads, analysis, rendering)
+_queue_lock = threading.Lock()        # serialises misc jobs (covers, single re-renders)
+dl_sem = threading.Semaphore(4)       # up to 4 parallel downloads at full line speed
+clip_lock = threading.Lock()          # serialises GPU/CPU-heavy moment analysis & rendering
 
 class Job:
     def __init__(self, kind, title):
@@ -22,20 +24,21 @@ class Job:
                 "progress": round(self.progress, 3), "step": self.step, "error": self.error,
                 "started": self.started, "result": self.result}
 
-def start(kind, title, fn, *args, **kwargs):
+def start(kind, title, fn, *args, parallel=False, **kwargs):
     job = Job(kind, title)
     JOBS[job.id] = job
 
     def runner():
-        with _queue_lock:
+        ctx = threading.Lock() if parallel else _queue_lock
+        with ctx:
             job.status, job.step = "running", "Starting"
             try:
                 job.result = fn(job, *args, **kwargs)
                 job.status, job.progress, job.step = "done", 1.0, "Done"
-                core.say("job", f"{title}: done")
+                core.say("job", f"{job.title}: done")
             except Exception as e:
                 job.status, job.error = "failed", str(e)[:800]
-                core.say("job", f"{title} failed: {e}", "error")
+                core.say("job", f"{job.title} failed: {e}", "error")
                 core.say("job", traceback.format_exc()[-1500:], "debug")
     threading.Thread(target=runner, daemon=True).start()
     return job

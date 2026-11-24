@@ -24,41 +24,59 @@ def new_project(title, source):
     save(p)
     return p
 
-def from_link(job, url):
+def from_link(job, url, pid=None):
     """Downloads a stream VOD or video with yt-dlp. Only use videos you own or have permission to use."""
     if not re.match(r"^https?://", url.strip()):
         raise ValueError("That doesn't look like a link.")
     ytdlp = core.which("yt-dlp")
     if not ytdlp:
         raise RuntimeError("yt-dlp isn't installed. Run the installer again (it installs it for you).")
-    job.update(0.02, "Reading the link")
-    info = core.run([ytdlp, "--no-playlist", "--print", "%(title)s", "--skip-download", "--", url], timeout=120)
-    title = (info.stdout.strip().splitlines() or ["Downloaded video"])[0][:120]
-    p = new_project(title, url)
-    out = os.path.join(project_dir(p["id"]), "source.%(ext)s")
-    job.update(0.05, "Downloading (this can take a while for long streams)")
+    p = load(pid) if pid else None
+    dur_est = 0
+    if not p:
+        job.update(0.02, "Reading the link")
+        info = core.run([ytdlp, "-4", "--no-playlist", "--print", "%(title)s\t%(duration)s", "--skip-download", "--", url], timeout=120)
+        first = (info.stdout.strip().splitlines() or ["Downloaded video\t0"])[0].split("\t")
+        title = (first[0] or "Downloaded video")[:120]
+        try: dur_est = int(float(first[1])) if len(first) > 1 and first[1].replace(".", "").isdigit() else 0
+        except Exception: dur_est = 0
+        p = new_project(title, url)
+    pdir = project_dir(p["id"])
+    existing = next((os.path.join(pdir, f) for f in os.listdir(pdir)
+                     if f.startswith("source.") and f.endswith(".mp4") and not f.endswith(".part")), None)
+    if existing and os.path.getsize(existing) > 0:
+        return finish(p, existing)
+    out = os.path.join(pdir, "source.%(ext)s")
+    has_part = any(f.startswith("source.") and ".part" in f for f in os.listdir(pdir))
+    max_h = 720 if dur_est > 5400 and not has_part else 1080
+    fmt = (f"bv*[height<={max_h}]+ba/b[height<={max_h}]/b" if has_part else
+           f"bv*[height<={max_h}][vcodec^=avc1]+ba[acodec^=mp4a]/bv*[height<={max_h}]+ba/b[height<={max_h}]/b")
+    aria = core.which("aria2c")
+    dl_args = (["--downloader", aria, "--downloader-args", "aria2c:-x 16 -s 16 -k 2M --summary-interval=1 --console-log-level=warn"]
+               if aria and not has_part else ["--http-chunk-size", "10M"])
+    job.update(0.05, "Downloading (16x turbo streams)" if (aria and not has_part) else "Downloading (16x parallel fragments)")
     import subprocess
     env = dict(os.environ, PATH=":".join(core.BREW_PATHS + [os.environ.get("PATH", "")]))
-    proc = subprocess.Popen([ytdlp, "--no-playlist", "--newline", "-f", "bv*[height<=1080]+ba/b[height<=1080]/b",
-                             "--merge-output-format", "mp4", "-o", out, "--", url],
+    proc = subprocess.Popen([ytdlp, "-4", "--no-playlist", "--continue", "--concurrent-fragments", "16", *dl_args,
+                             "--newline", "-f", fmt, "--merge-output-format", "mp4", "-o", out, "--", url],
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
     for line in proc.stdout:
-        m = re.search(r"\[download\]\s+([\d.]+)%", line)
+        m = re.search(r"\[download\]\s+([\d.]+)%", line) or re.search(r"\((\d+(?:\.\d+)?)%\)", line)
         if m: job.update(0.05 + 0.9 * float(m.group(1)) / 100, f"Downloading {m.group(1)}%")
     if proc.wait() != 0:
         raise RuntimeError("The download failed. Is the video public, and is the link right?")
-    video = next((os.path.join(project_dir(p["id"]), f) for f in os.listdir(project_dir(p["id"])) if f.startswith("source.") and f.endswith(".mp4")), None)
+    video = next((os.path.join(pdir, f) for f in os.listdir(pdir) if f.startswith("source.") and f.endswith(".mp4")), None)
     if not video:
         raise RuntimeError("Downloaded, but couldn't find the video file.")
     return finish(p, video)
 
-def from_file(job, path, move=False):
+def from_file(job, path, move=False, pid=None):
     if not os.path.isfile(path):
         raise FileNotFoundError(path)
-    p = new_project(os.path.splitext(os.path.basename(path))[0], path)
+    p = (load(pid) if pid else None) or new_project(os.path.splitext(os.path.basename(path))[0], path)
     dst = os.path.join(project_dir(p["id"]), "source" + os.path.splitext(path)[1].lower())
     job.update(0.1, "Copying the video into the project")
-    (shutil.move if move else shutil.copyfile)(path, dst)
+    (shutil.move if move else core.fast_copy)(path, dst)
     return finish(p, dst)
 
 def finish(p, video):

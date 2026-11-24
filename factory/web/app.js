@@ -192,7 +192,7 @@ async function saveAI(p) {
 
 // ------------------------------------------------------------ "let AI do it" prompts
 const RULES = `Rules: never type my passwords or 2FA codes (I'll do those), don't accept terms, pay for anything or change account settings without asking me first, and pause whenever Meta or Google asks me to verify something. When a key or secret appears, don't paste it anywhere yourself: tell me where it is and I'll copy it into the Content Factory.`;
-const INTRO = () => `I'm setting up GTA VI Content Factory (${LINKS.repo}), a free open-source tool running on my Mac at http://localhost:8765. It clips my gameplay into reels and posts them through the official Instagram, Facebook and Threads APIs. My page is "${S.settings.page_name || "my page"}"${S.settings.handle ? ` (@${S.settings.handle})` : ""}. Please use my browser to help me with this step by step, and tell me what you're doing as you go.`;
+const INTRO = () => `I'm setting up GTA VI Content Factory (${LINKS.repo}), a free open-source tool running on my Mac at ${location.origin}. It clips my gameplay into reels and posts them through the official Instagram, Facebook and Threads APIs. My page is "${S.settings.page_name || "my page"}"${S.settings.handle ? ` (@${S.settings.handle})` : ""}. Please use my browser to help me with this step by step, and tell me what you're doing as you go.`;
 const PROMPTS = {
   meta: () => `${INTRO()}
 
@@ -322,24 +322,29 @@ function home() {
       <div class="nums"><div><b>${c.posted}</b><span>posted</span></div><div><b>${c.waiting}</b><span>waiting</span></div>${c.error ? `<div class="bad"><b>${c.error}</b><span>failed</span></div>` : ""}</div>
       <div class="next" id="cd_${tag}">${st.until ? `Next post in <b>${countdown(st.until)}</b>` : S.accounts[p] ? esc(st.account || "Ready when you start") : `<a href="#accounts">Connect ${label}</a>`}</div></div>`; }).join("")}</div>
   <div class="split"><div>
-    <h2>Up next<span class="grow"></span>${S.up_next.length ? `<button class="btn ghost sm" onclick="go('review')">Review more</button>` : ""}</h2>
+    <h2>Up next<span class="grow"></span><button class="btn sm" onclick="syncSTier()">${ic("star")} Sync Ready Reels</button><button class="btn ghost sm" onclick="go('review')">Review more</button></h2>
     ${S.up_next.length ? `<div class="list">${S.up_next.map((it) => `<div class="li"><div class="thumb ${it.kind === "reel" ? "" : "wide"}">${it.cover ? `<img src="${media(it.cover)}">` : `<video src="${media(it.file)}#t=1" preload="metadata" muted></video>`}</div>
-        <div class="meta"><b>${esc(it.title)}</b><span class="kind">${it.kind === "reel" ? "Reel" : "Long part"}</span></div>
+        <div class="meta"><b>${it.tier === "S" ? `<span class="pill ok" style="margin-right:6px">S-TIER</span>` : ""}${esc(it.title)}</b><span class="kind">${esc(it.source_tag || (it.kind === "reel" ? "Reel" : "Long part"))}</span></div>
         <div class="chips">${it.todo.map((p) => `<span class="chip ${it.errors.includes(p) ? "err" : ""}" title="${it.errors.includes(p) ? "failed, will not retry by itself" : "waiting"}">${PLAT.find((x) => x[0] === p)[1]}</span>`).join("")}</div></div>`).join("")}</div>`
-      : `<div class="list"><div class="empty-state">${ic("film")}<b>Queue is empty</b>Approve some reels and they line up here.</div></div>`}
+      : `<div class="list"><div class="empty-state">${ic("film")}<b>Queue is empty</b>Approve some reels or click Sync Global S-Tier.</div></div>`}
     <h2>Working on</h2>
     ${jobs.length ? `<div class="list">${jobs.map((j) => `<div class="li"><span class="dot ${j.status === "failed" ? "no" : "busy"}"></span><div class="meta"><b>${esc(j.title)}</b><span>${esc(j.error || j.step)}</span></div>
         <div class="mini-bar"><span class="small muted">${Math.round(j.progress * 100)}%</span><div class="bar"><i style="width:${Math.round(j.progress * 100)}%"></i></div></div></div>`).join("")}</div>`
       : `<div class="list"><div class="li"><div class="meta"><span>Nothing running. Drop a video in and it starts here.</span></div><button class="btn sm" onclick="go('videos')">${ic("plus")} Add video</button></div></div>`}
-    ${S.recent.length ? `<h2>Recently posted</h2><div class="list">${S.recent.map((r) => `<div class="li"><div class="logo-tile">${ic(PLAT.find((x) => x[0] === r.platform)?.[3] || "spark")}</div><div class="meta"><b>${esc(r.title)}</b><span>${ago(r.at)}</span></div>${r.url ? `<a class="btn sm ghost" href="${esc(r.url)}" target="_blank">Open ${ic("arrow")}</a>` : ""}</div>`).join("")}</div>` : ""}
+    ${S.recent.length ? `<h2>Recently posted<span class="grow"></span><button class="btn ghost sm" onclick="refreshStats()">${ic("refresh")} Refresh stats</button></h2><div class="list">${S.recent.map((r) => {
+      const m = r.metrics || {}, stats = [m.views != null ? `${m.views} views` : "", m.likes != null ? `${m.likes} likes` : "", m.shares ? `${m.shares} shares` : ""].filter(Boolean).join(" · ");
+      return `<div class="li"><div class="logo-tile">${ic(PLAT.find((x) => x[0] === r.platform)?.[3] || "spark")}</div><div class="meta"><b>${esc(r.title)}</b><span>${ago(r.at)}${stats ? ` · <b>${esc(stats)}</b>` : ""}</span></div>${r.url ? `<a class="btn sm ghost" href="${esc(r.url)}" target="_blank">Open ${ic("arrow")}</a>` : ""}</div>`;
+    }).join("")}</div>` : ""}
   </div><div><h2>Live log</h2><div class="log" id="feed">${feedHTML()}</div></div></div>`;
-  const actions = `<button class="btn ghost sm" onclick="openFolder('home')">${ic("folder")} Folder</button>` +
+  const actions = `<button class="btn ghost sm" onclick="openFolder('ship_inbox')">${ic("upload")} Drop-to-Ship folder</button><button class="btn ghost sm" onclick="openFolder('home')">${ic("folder")} Folder</button>` +
     (running ? `<button class="btn" onclick="postStop()">${ic("pause")} Pause posting</button>` : `<button class="btn hot" onclick="postStart()">${ic("play")} Start posting</button>`);
   return shell("Dashboard", actions, content);
 }
 const feedHTML = () => S.feed.map((l) => `<div class="${esc(l.level)}"><span class="t">${esc(l.t.slice(11, 19))}</span> <span class="g">${esc(l.tag)}</span> ${esc(l.msg)}</div>`).join("") + `<div><span class="cursor"></span></div>`;
 async function postStart() { await api("/api/posting/start", {}); toast("Posting started"); await refresh(); render(); }
 async function postStop() { await api("/api/posting/stop", {}); toast("Posting pauses after the current upload"); await refresh(); render(); }
+async function syncSTier() { const r = await api("/api/queue/import_folder", {}); toast(`Synced ${r.total} Global S-Tier clips (+${r.added} new, ${r.updated} updated)`); await refresh(); render(); }
+async function refreshStats() { toast("Fetching live views & likes…"); const r = await api("/api/posting/insights", {}); toast(`Updated stats on ${r.updated} post(s)`); await refresh(); render(); }
 
 // ------------------------------------------------------------ videos
 function videos() {
@@ -414,14 +419,40 @@ async function previewCover() { toast("Rendering…"); const r = await api("/api
 
 // ------------------------------------------------------------ youtube
 function youtube() {
-  const content = `<p class="sub">Google keeps script uploads private until an app passes its audit, so you drag and the factory does everything else.</p>
-  <div class="list intg"><div class="item"><div class="li"><div class="logo-tile">${ic("folder")}</div><div class="meta"><b>1 · Make Day folders</b><span>${S.settings.youtube_per_day} videos per day: Shorts plus up to 2 long parts, named with their titles, with thumbnails and a descriptions file.</span></div><button class="btn primary sm" onclick="ytBuild()">Make folders</button></div></div>
-    <div class="item"><div class="li"><div class="logo-tile">${ic("upload")}</div><div class="meta"><b>2 · Drag into YouTube Studio</b><span>Create → Upload videos, drop a Day folder's files in. They land as drafts.</span></div><a class="btn sm" href="https://studio.youtube.com" target="_blank">Open Studio ${ic("arrow")}</a></div></div>
-    <div class="item"><div class="li"><div class="logo-tile">${ic("spark")}</div><div class="meta"><b>3 · Let Claude schedule them</b><span>With the <code>youtube-studio-scheduler</code> skill: “schedule my drafts every 30 minutes, 2 long videos a day”.</span></div>${aiBtn("yt", "Copy prompt")}</div></div></div>
-  <div class="card" style="margin-top:16px"><b>Lift the upload limit</b><p class="muted small" style="margin:4px 0 0">Verify your channel (Studio → Settings → Channel → Feature eligibility → Advanced features) to go past ~15 uploads a day.</p></div>`;
-  return shell("YouTube", `<button class="btn ghost sm" onclick="openFolder('youtube')">${ic("folder")} Uploads folder</button>`, content);
+  const yb = S.youtube_bot || { day_folders: [] };
+  const days = yb.day_folders?.length ? yb.day_folders : ["S-Tier Day 01"];
+  const statusPill = yb.signed_in
+    ? `<span class="pill ok">Signed into YouTube Studio</span>`
+    : yb.browser_open
+      ? `<span class="pill busy">Chrome open — finish sign-in</span>`
+      : `<span class="pill">Sign in once</span>`;
+  const content = `<p class="sub">100% hands-free local Chrome + Playwright scheduler — bypasses Google's 6/day unaudited API Private lock.</p>
+  <div class="list intg">
+    <div class="item"><div class="li"><div class="logo-tile">${ic("yt")}</div>
+      <div class="meta"><b>1 · Connect YouTube Studio (One-Time Sign-In)</b><span>Opens a dedicated Google Chrome window saved on this Mac. Sign into your <b>@${esc(S.settings.handle || "yourchannel")}</b> YouTube channel once — stays logged in forever.</span></div>
+      ${statusPill}<button class="btn ${yb.signed_in ? "sm" : "primary sm"}" onclick="ytLogin()">${yb.signed_in ? "Open Chrome" : "Sign in on Chrome"}</button></div></div>
+    <div class="item"><div class="li" style="flex-wrap:wrap;gap:10px"><div class="logo-tile">${ic("play")}</div>
+      <div class="meta"><b>2 · Auto-Upload & Schedule Day Pack</b><span>Uploads every <code>.mp4</code>, attaches <code>- thumbnail.jpg</code>, fills title & description, marks Not Made For Kids, and schedules Public posts (${yb.scheduled_count || 0} scheduled so far).</span></div>
+      <select id="yt_day" style="width:auto;min-width:165px">${days.map((d) => `<option value="${esc(d)}">${esc(d)}</option>`).join("")}</select>
+      <input type="number" id="yt_gap" value="30" min="15" step="15" style="width:82px" title="Minutes between scheduled posts">
+      <span class="small muted">min apart</span>
+      <button class="btn hot sm" onclick="ytAutoPost()">${ic("upload")} Start Auto-Schedule</button></div></div>
+    <div class="item"><div class="li"><div class="logo-tile">${ic("star")}</div>
+      <div class="meta"><b>3 · Build more Day packs</b><span>Packs your priority queue into numbered Day folders with <code>9:16</code> + <code>16:9</code> thumbnails & descriptions.</span></div>
+      <button class="btn sm" onclick="ytBuild('S-Tier Day', 3)">Build S-Tier packs</button>
+      <button class="btn ghost sm" onclick="ytBuild('Day', 7)">Build more Days</button></div></div>
+  </div>
+  <div class="card" style="margin-top:16px"><b>Tip: Unlock 15+ daily uploads & custom thumbnails</b><p class="muted small" style="margin:4px 0 0">Inside YouTube Studio → <b>Settings → Channel → Feature eligibility → Intermediate & Advanced features</b>: verify your phone number once so YouTube lets the bot attach custom thumbnails and upload 15+ Shorts/day.</p></div>`;
+  return shell("YouTube Auto-Poster", `<button class="btn ghost sm" onclick="openFolder('youtube')">${ic("folder")} Uploads folder</button>`, content);
 }
-async function ytBuild() { const r = await api("/api/youtube/build", { days: 7 }); toast(r.made.length ? "Made " + r.made.join(", ") : "Nothing new: approve more videos first"); }
+async function ytBuild(prefix = "Day", days = 7) { const r = await api("/api/youtube/build", { days, prefix }); await refresh(); render(); toast(r.made.length ? "Made " + r.made.join(", ") : "Nothing new: approve or sync more videos first"); }
+async function ytLogin() { await api("/api/youtube/login", {}); toast("Opened YouTube Studio Chrome window — sign into your YouTube channel once!", 6000); setTimeout(() => refresh().then(render), 2500); }
+async function ytAutoPost() {
+  const day = $("#yt_day")?.value || "S-Tier Day 01", spacing_min = Number($("#yt_gap")?.value || 45);
+  await api("/api/youtube/autopost", { day, spacing_min, max_videos: 15 });
+  toast(`Started YouTube Auto-Scheduler for ${day}! Follow progress on Dashboard.`, 5000);
+  await refresh(); go("home");
+}
 
 // ------------------------------------------------------------ settings
 function settings() {
@@ -432,9 +463,15 @@ function settings() {
   ${sect("AI", "Which model watches each moment and writes the hook.", aiPicker())}
   ${sect("Clipping", "How long videos are cut up.", `<div class="grid g3">${num("reel_seconds", "Reel length (sec)", "25 is safe for Instagram's API.")}${num("reels_per_hour", "Reels per hour")}${num("long_minutes", "Long part (min)")}</div>
     <label>Credit line on reels</label><input id="s_credit_line" value="${esc(s.credit_line)}" placeholder="gameplay: @creator"><p class="help">Only when clipping someone else, with their permission.</p>`)}
-  ${sect("Posting", "How often each platform posts, and when.", `<div class="grid g3">${PLAT.map(([p, , l]) => `<div><label>${l} · every (min)</label><input type="number" id="pe_${p}" value="${s.post_every_min[p]}"></div>`).join("")}</div>
-    <label>Post only between (24h, this Mac's time)</label><div class="grid g2"><input type="number" id="ph_a" value="${s.post_hours[0]}"><input type="number" id="ph_b" value="${s.post_hours[1]}"></div>
+  ${sect("Posting", "Priority S-Tier scheduler, cross-platform stagger, human jitter & IG Trial Reels.", `<div class="grid g3">${PLAT.map(([p, , l]) => `<div><label>${l} · every (min)</label><input type="number" id="pe_${p}" value="${s.post_every_min[p]}"></div>`).join("")}</div>
+    <div class="grid g3" style="margin-top:8px">${PLAT.map(([p, , l]) => `<div><label>${l} · stagger offset (min)</label><input type="number" id="ps_${p}" value="${(s.platform_stagger_min || {})[p] ?? 0}"></div>`).join("")}</div>
+    <div class="grid g3" style="margin-top:8px"><input type="number" id="ph_a" value="${s.post_hours[0]}" title="Start hour (0-24)"><input type="number" id="ph_b" value="${s.post_hours[1]}" title="End hour (0-24)"><input type="number" id="s_jitter_min" value="${s.jitter_min ?? 6}" title="+- human jitter minutes"></div>
+    <p class="help">Left/middle: active hours (24h). Right: +- random jitter minutes around each slot.</p>
     <label>Platforms on</label><div class="checks">${PLAT.map(([p, , l]) => `<label><input type="checkbox" id="po_${p}" ${s.platforms_on[p] ? "checked" : ""}>${l}</label>`).join("")}</div>
+    <label>Smart shipping upgrades</label><div class="checks">
+      <label><input type="checkbox" id="opt_trial" ${s.ig_trial_reels !== false ? "checked" : ""}>Instagram Trial Reels (non-follower discovery)</label>
+      <label><input type="checkbox" id="opt_rot" ${s.caption_rotation !== false ? "checked" : ""}>Rotate 5 native CTA caption styles</label>
+      <label><input type="checkbox" id="opt_thumb" ${s.auto_thumb_offset !== false ? "checked" : ""}>Auto sharpest-frame reel cover</label></div>
     <p class="help">Daily API limits: Instagram ~50, Facebook ~30 reels, Threads 250.</p>`)}
   ${sect("Captions", "Placeholders: {hook} {handle} {page} {game} {keywords} {hashtags}", `${PLAT.map(([p, , l]) => `<label>${l}</label><textarea id="s_caption_${p}">${esc(s["caption_" + p])}</textarea>`).join("")}<label>Hashtags</label><input id="s_hashtags" value="${esc(s.hashtags)}">`)}
   ${sect("Setup", "Walk through the onboarding again.", `<button class="btn" onclick="rerunSetup()">Run setup again</button>`)}
@@ -448,6 +485,11 @@ async function saveSettings() {
     reel_seconds: n("reel_seconds"), reels_per_hour: n("reels_per_hour"), long_minutes: n("long_minutes"), credit_line: v("credit_line"),
     caption_instagram: v("caption_instagram"), caption_facebook: v("caption_facebook"), caption_threads: v("caption_threads"), hashtags: v("hashtags"),
     post_every_min: Object.fromEntries(PLAT.map(([p]) => [p, Number($("#pe_" + p).value)])),
+    platform_stagger_min: Object.fromEntries(PLAT.map(([p]) => [p, Number($("#ps_" + p).value)])),
+    jitter_min: Number($("#s_jitter_min").value),
+    ig_trial_reels: $("#opt_trial").checked,
+    caption_rotation: $("#opt_rot").checked,
+    auto_thumb_offset: $("#opt_thumb").checked,
     post_hours: [Number($("#ph_a").value), Number($("#ph_b").value)],
     platforms_on: Object.fromEntries(PLAT.map(([p]) => [p, $("#po_" + p).checked])),
   });
@@ -470,9 +512,10 @@ async function tick() {
     const typing = document.activeElement?.matches("input,textarea,select");
     const playing = [...document.querySelectorAll("video")].some((v) => !v.paused);
     const sig = JSON.stringify([S.counts, S.up_next.map((i) => i.id + i.todo), S.jobs.map((j) => j.status + Math.round(j.progress * 100) + j.step),
-      S.posting.running, Object.values(S.posting.status).map((x) => x.state + x.kind), S.projects.length, S.recent.length, S.accounts]);
+      S.posting.running, Object.values(S.posting.status).map((x) => x.state + x.kind),
+      S.projects.map((p) => p.id + p.status + p.reels + p.approved + p.longs), S.recent.length, S.accounts, S.youtube_bot?.signed_in, S.youtube_bot?.browser_open]);
     const changed = sig !== tick.sig; tick.sig = sig;
-    if (S.settings.setup_done && view === "home" && changed && !typing && !playing) render();
+    if (S.settings.setup_done && ["home", "videos", "review", "youtube"].includes(view) && changed && !typing && !playing) render();
     else if ($("#feed")) { const f = $("#feed"), atEnd = f.scrollTop + f.clientHeight >= f.scrollHeight - 30; f.innerHTML = feedHTML(); if (atEnd) f.scrollTop = f.scrollHeight; }
   } catch (e) { toast("Lost connection to the factory. Is it still running?"); }
 }

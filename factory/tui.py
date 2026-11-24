@@ -3,7 +3,7 @@
 Keys:  s start/stop posting   a approve everything waiting for review   o open the web app
        f open the factory folder   w switch to the web app next time   g star on GitHub   x follow on X   q quit
 """
-import curses, subprocess, sys, time, webbrowser
+import curses, json, subprocess, sys, time, urllib.request, webbrowser
 
 from . import core, posting, pipeline, server
 
@@ -11,6 +11,17 @@ PLAT = [("instagram", "IG", "Instagram"), ("facebook", "FB", "Facebook"), ("thre
 REPO = "https://github.com/priyanshuratnakar/gta-vi-content-factory"
 X = "https://x.com/0xratnakar"
 SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+
+def _http_api(url, path, body=None):
+    req = urllib.request.Request(
+        url.rstrip("/") + path,
+        method="POST" if body is not None else "GET",
+        data=json.dumps(body).encode() if body is not None else None,
+        headers={"Content-Type": "application/json", "x-gvcf": "1"},
+    )
+    with urllib.request.urlopen(req, timeout=4) as r:
+        return json.loads(r.read().decode())
 
 
 def _cd(until):
@@ -25,8 +36,8 @@ def _bar(frac, width):
 
 
 class UI:
-    def __init__(self, scr, url):
-        self.scr, self.url, self.msg, self.msg_t, self.frame = scr, url, "", 0, 0
+    def __init__(self, scr, url, remote=False):
+        self.scr, self.url, self.remote, self.msg, self.msg_t, self.frame = scr, url, remote, "", 0, 0
         curses.curs_set(0); scr.nodelay(True); scr.timeout(500)
         curses.start_color(); curses.use_default_colors()
         for i, c in enumerate([curses.COLOR_MAGENTA, curses.COLOR_CYAN, curses.COLOR_GREEN,
@@ -44,14 +55,14 @@ class UI:
     def note(self, m): self.msg, self.msg_t = m, time.time()
 
     def draw(self):
-        S = server.state()
+        S = _http_api(self.url, "/api/state") if self.remote else server.state()
         self.scr.erase(); h, w = self.scr.getmaxyx(); self.frame += 1
         running = any(S["posting"]["running"].values())
         # header: a little Vice City sunset
         self.put(0, 2, "▄▀▄▀ ", self.PINK | curses.A_BOLD)
         self.put(0, 7, "CONTENT FACTORY", curses.A_BOLD)
-        self.put(0, 23, f"· {S['settings'].get('page_name') or 'your page'}", self.DIM)
-        state = "● POSTING" if running else "○ PAUSED"
+        self.put(0, 23, f"· {S['settings'].get('page_name') or 'your page'} · SYNC 1/HR", self.DIM)
+        state = "● LIVE POSTING" if running else "○ PAUSED"
         self.put(0, w - len(state) - 3, state, (self.GREEN if running else self.YELLOW) | curses.A_BOLD)
         self.put(1, 2, "─" * (w - 4), self.PINK | self.DIM)
 
@@ -70,6 +81,13 @@ class UI:
             if c["error"]: self.put(y, 72, f"{c['error']} failed", self.RED)
             if st.get("until"): self.put(y, 83, f"next {_cd(st['until'])}", self.PINK)
             y += 1
+        yb = S.get("youtube_bot") or {}
+        yt_st = "signed in" if yb.get("signed_in") else ("chrome open" if yb.get("browser_open") else "idle")
+        self.put(y, 2, "YouTube   ", curses.A_BOLD)
+        self.put(y, 13, "●", self.GREEN if yb.get("signed_in") else self.YELLOW)
+        self.put(y, 15, f"{yt_st:<28}", self.GREEN if yb.get("signed_in") else self.YELLOW)
+        self.put(y, 45, f"{yb.get('scheduled_count', 0):>4} scheduled", self.WHITE)
+        y += 1
 
         y += 1
         self.put(y, 2, "WORKING ON", self.DIM | curses.A_BOLD); y += 1
@@ -99,7 +117,8 @@ class UI:
         y += 1
         self.put(y, 2, "LIVE", self.DIM | curses.A_BOLD); y += 1
         room = h - y - 4
-        for l in list(core.FEED)[-max(0, room):]:
+        feed_items = S.get("feed", []) if self.remote else list(core.FEED)
+        for l in feed_items[-max(0, room):]:
             col = self.RED if l["level"] in ("error", "bad") else self.GREEN if l["level"] in ("good", "ok") else 0
             self.put(y, 2, l["t"][11:19], self.DIM)
             self.put(y, 11, f"{l['tag'][:9]:<9}", self.PINK)
@@ -116,9 +135,13 @@ class UI:
         if k in (ord("q"), 27): return False
         if k == ord("s"):
             if any(S["posting"]["running"].values()):
-                posting.stop_all(); core.save_settings({"posting_on": False}); self.note("Posting stops after the current upload.")
+                if self.remote: _http_api(self.url, "/api/posting/stop", {})
+                else: posting.stop_all(); core.save_settings({"posting_on": False})
+                self.note("Posting stops after the current upload.")
             else:
-                core.save_settings({"posting_on": True}); posting.start_all(); self.note("Posting started.")
+                if self.remote: _http_api(self.url, "/api/posting/start", {})
+                else: core.save_settings({"posting_on": True}); posting.start_all()
+                self.note("Posting started.")
         if k == ord("a"):
             n = 0
             for p in S["projects"]:
@@ -134,9 +157,9 @@ class UI:
         return True
 
 
-def run(url):
+def run(url, remote=False):
     def loop(scr):
-        ui = UI(scr, url)
+        ui = UI(scr, url, remote=remote)
         while True:
             S = ui.draw()
             k = scr.getch()

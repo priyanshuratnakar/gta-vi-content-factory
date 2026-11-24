@@ -1,18 +1,23 @@
 """Posts approved videos from the queue to Instagram, Facebook and Threads with the official APIs.
 
-Safety rules (learned the hard way):
-- before every post we check the account for a post with the same first line, so nothing goes up twice
-- only upload problems are retried (they happen before anything is published); anything else is skipped
-- three failures in a row stops that platform until you press Start again
+Upgrades over upstream:
+1. Tier-priority scheduler (`priority` / `S-Tier` first, peak-hour S-Tier boost, cross-platform stagger + human jitter).
+2. Local SHA-256 media-hash ledger (`logs/posted_hashes.json`) + remote `find_live` double-guard against duplicates.
+3. Auto-scored sharpest frame `thumb_offset` (ms) + Instagram Trial Reels (`SS_PERFORMANCE` with automatic standard fallback).
+4. Self-healing, single-file scoped `VideoLink` Cloudflare tunnel (never exposes HOME_DIR; auto-restarts if tunnel drops).
+5. Permanent Facebook Page token caching + 60-day Instagram & Threads token auto-refresh.
+6. Live post analytics poller (`refresh_insights()` -> views, likes, comments, shares stored on queue items).
 """
-import os, re, sys, json, time, shutil, socket, threading, subprocess, urllib.parse, urllib.request, urllib.error, datetime
-from . import core, pipeline
+import os, re, sys, json, time, uuid, random, shutil, socket, tempfile, threading, subprocess, urllib.parse, urllib.request, urllib.error, datetime
+from . import core, pipeline, covers, render
 
 API = "v23.0"
 G_FB, G_IG, G_TH = f"https://graph.facebook.com/{API}", f"https://graph.instagram.com/{API}", "https://graph.threads.net/v1.0"
 STATUS = {}                 # platform -> {"state","until","account","kind"} for the web app
+LEDGER_FILE = os.path.join(core.DIRS["logs"], "posted_hashes.json")
 _qlock = threading.Lock()
 _stop = threading.Event()
+_next_jitter = {}
 
 class AuthError(RuntimeError): pass
 
@@ -46,8 +51,8 @@ def form(d): return urllib.parse.urlencode(d).encode()
 def _state(tag, text, secs=None, kind="wait", **extra):
     STATUS.setdefault(tag, {}).update(state=text, until=(time.time() + secs) if secs else None, kind=kind, **extra)
 
-def _nap(tag, secs, text):
-    _state(tag, text, secs)
+def _nap(tag, secs, text, total_until=None):
+    _state(tag, text, total_until if total_until is not None else secs)
     _stop.wait(secs)
 
 def push_file(url, token, path):
@@ -62,14 +67,93 @@ def push_file(url, token, path):
 def first_line(caption):
     return next((l.strip() for l in caption.splitlines() if l.strip() and not l.lower().startswith("follow ")), caption[:80])
 
-# ---------------- token helpers (make keys last, so users rarely touch them) ----------------
+# ---------------- SHA-256 duplicate ledger + sharpest cover offset ----------------
+def ledger_check(platform, path):
+    if not path or not os.path.isfile(path): return None
+    sha = pipeline.file_sha256(path)
+    led = core.read_json(LEDGER_FILE, {})
+    hit = led.get(f"{platform}:{sha}")
+    return (hit["id"], hit.get("url", "")) if hit and hit.get("id") else None
+
+def ledger_record(platform, path, mid, url):
+    if not path or not os.path.isfile(path): return
+    with _qlock:
+        sha = pipeline.file_sha256(path)
+        led = core.read_json(LEDGER_FILE, {})
+        led[f"{platform}:{sha}"] = {"id": mid, "url": url, "time": time.time(), "file": os.path.basename(path)}
+        core.write_json(LEDGER_FILE, led)
+
+def best_thumb_offset_ms(path):
+    """Pick the sharpest, best-exposed mid-action timestamp (in ms) so IG/FB profile grids never get a black/blurry frame 0."""
+    try:
+        dur = core.duration(path)
+        if dur <= 2.0: return 500
+        tmp_dir = tempfile.mkdtemp(prefix="gvcf_thumb_")
+        best = (-1.0, int(dur * 350))
+        try:
+            for i, frac in enumerate((0.18, 0.34, 0.50, 0.68, 0.82)):
+                ts = max(0.3, min(dur - 0.5, dur * frac))
+                jp = os.path.join(tmp_dir, f"f{i}.jpg")
+                render.still(path, ts, jp)
+                sc = covers._frame_quality(jp)
+                if sc > best[0]:
+                    best = (sc, int(round(ts * 1000)))
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        return best[1]
+    except Exception:
+        return 1500
+
+# ---------------- token helpers (permanent FB Page token + IG/TH auto-refresh) ----------------
 def fb_long_lived(short_token):
-    """With the app id + secret saved, swap a 1-hour token for a 60-day one."""
+    """Swap a 1-hour Meta user token for a 60-day token and cache expiration."""
     app_id, secret = core.get_key("meta_app_id"), core.get_key("meta_app_secret")
     if not (app_id and secret): return short_token
     r = _req("GET", f"{G_FB}/oauth/access_token", {"grant_type": "fb_exchange_token", "client_id": app_id,
                                                   "client_secret": secret, "fb_exchange_token": short_token})
+    if r.get("access_token"):
+        core.set_key("meta_user_token_expires", str(int(time.time()) + int(r.get("expires_in", 5184000))))
     return r.get("access_token", short_token)
+
+def cache_permanent_page_token(user_token, page_id=""):
+    """A Page token derived from a long-lived User token has NO expiry date — cache it directly so FB never dies at 60 days."""
+    try:
+        if page_id:
+            pg = _req("GET", f"{G_FB}/{page_id}", {"fields": "id,name,access_token", "access_token": user_token})
+            if pg.get("access_token"):
+                core.set_key("facebook_page_token", pg["access_token"])
+                core.set_key("facebook_page_id", pg["id"])
+                return pg["access_token"]
+        pages = _req("GET", f"{G_FB}/me/accounts", {"fields": "id,name,access_token", "limit": 100, "access_token": user_token}).get("data", [])
+        if len(pages) == 1 and pages[0].get("access_token"):
+            core.set_key("facebook_page_token", pages[0]["access_token"])
+            core.set_key("facebook_page_id", pages[0]["id"])
+            return pages[0]["access_token"]
+    except Exception:
+        pass
+    return ""
+
+def instagram_refresh():
+    """Auto-refresh IG Business Login tokens (`IG...`) or Meta User tokens (`EAA...`) when <20 days remain."""
+    t = core.get_key("instagram_token")
+    if not t: return
+    exp = int(core.get_key("instagram_token_expires") or core.get_key("meta_user_token_expires") or 0)
+    if exp and exp - time.time() > 20 * 86400: return
+    try:
+        if t.startswith("IG"):
+            r = _req("GET", "https://graph.instagram.com/refresh_access_token", {"grant_type": "ig_refresh_token", "access_token": t})
+            if r.get("access_token"):
+                core.set_key("instagram_token", r["access_token"])
+                core.set_key("instagram_token_expires", str(int(time.time()) + int(r.get("expires_in", 5184000))))
+                core.say("IG", "Instagram key refreshed for another 60 days")
+        elif t.startswith("EAA") and core.get_key("meta_app_id") and core.get_key("meta_app_secret"):
+            nt = fb_long_lived(t)
+            if nt and nt != t:
+                core.set_key("instagram_token", nt)
+                core.set_key("facebook_token", nt)
+                core.say("IG", "Meta user key extended for another 60 days")
+    except Exception as e:
+        core.say("IG", f"couldn't auto-refresh Instagram key: {str(e)[:150]}", "warn")
 
 def threads_long_lived(token):
     secret = core.get_key("threads_app_secret") or core.get_key("meta_app_secret")
@@ -80,10 +164,9 @@ def threads_long_lived(token):
         core.set_key("threads_token_expires", str(int(time.time()) + int(r.get("expires_in", 5184000))))
         return r.get("access_token", token)
     except RuntimeError:
-        return token          # already long-lived, or the secret is for another app
+        return token
 
 def threads_refresh():
-    """Long-lived Threads tokens can be refreshed (needs to be >24h old). Run daily; extends to another 60 days."""
     t = core.get_key("threads_token")
     if not t: return
     exp = int(core.get_key("threads_token_expires") or 0)
@@ -132,21 +215,56 @@ class Instagram:
                 return m["id"], m.get("permalink", "")
         return None
 
-    def post(self, item):
+    def _create_container(self, item, offset_ms, trial, cover_url=""):
         f = {"media_type": "REELS", "upload_type": "resumable", "caption": item["captions"]["instagram"],
-             "share_to_feed": "true", "access_token": self.t}
-        c = req("POST", f"{self.g}/{self.id}/media", data=form(f), tag=self.tag)
-        cid = c["id"]
-        core.say(self.tag, f"uploading {os.path.getsize(item['file'])/1e6:.1f} MB")
-        push_file(c.get("uri") or f"https://rupload.facebook.com/ig-api-upload/{API}/{cid}", self.t, item["file"])
-        for _ in range(20):
-            time.sleep(30)
-            st = req("GET", f"{self.g}/{cid}", {"fields": "status_code,status", "access_token": self.t}, tag=self.tag)
-            if st.get("status_code") == "FINISHED": break
-            if st.get("status_code") in ("ERROR", "EXPIRED"):
-                raise RuntimeError(f"processing failed: {st.get('status')}  (Instagram's API refuses some longer reels; keep reels at 25s)")
+             "access_token": self.t}
+        if cover_url:
+            f["cover_url"] = cover_url
         else:
-            raise RuntimeError("still processing after 10 min")
+            f["thumb_offset"] = str(offset_ms)
+        if trial:
+            f["trial_params"] = json.dumps({"graduation_strategy": "SS_PERFORMANCE"})
+        else:
+            f["share_to_feed"] = "true"
+        return req("POST", f"{self.g}/{self.id}/media", data=form(f), tag=self.tag)
+
+    def post(self, item):
+        s = core.load_settings()
+        offset_ms = item.get("thumb_offset_ms") or (best_thumb_offset_ms(item["file"]) if s.get("auto_thumb_offset", True) else 1000)
+        use_trial = bool(s.get("ig_trial_reels", True))
+        cover_url, staged_cov = "", ""
+        if item.get("cover") and os.path.isfile(item["cover"]) and core.which("cloudflared"):
+            try:
+                if not getattr(self, "link", None): self.link = VideoLink()
+                cover_url, staged_cov = self.link.stage_url(item["cover"])
+            except Exception:
+                cover_url, staged_cov = "", ""
+        try:
+            try:
+                c = self._create_container(item, offset_ms, trial=use_trial, cover_url=cover_url)
+            except RuntimeError:
+                if use_trial:
+                    core.say(self.tag, "Trial Reels not active on this IG account yet — posting as standard Reel", "info")
+                    c = self._create_container(item, offset_ms, trial=False, cover_url=cover_url)
+                elif cover_url:
+                    c = self._create_container(item, offset_ms, trial=False, cover_url="")
+                else:
+                    raise
+            cid = c["id"]
+            core.say(self.tag, f"uploading {os.path.getsize(item['file'])/1e6:.1f} MB ({'custom 9:16 cover' if cover_url else f'cover @{offset_ms/1000:.1f}s'})")
+            push_file(c.get("uri") or f"https://rupload.facebook.com/ig-api-upload/{API}/{cid}", self.t, item["file"])
+            for _ in range(20):
+                time.sleep(30)
+                st = req("GET", f"{self.g}/{cid}", {"fields": "status_code,status", "access_token": self.t}, tag=self.tag)
+                if st.get("status_code") == "FINISHED": break
+                if st.get("status_code") in ("ERROR", "EXPIRED"):
+                    raise RuntimeError(f"processing failed: {st.get('status')}  (keep reels around 25-60s)")
+            else:
+                raise RuntimeError("still processing after 10 min")
+        finally:
+            if staged_cov:
+                try: os.remove(staged_cov)
+                except OSError: pass
         try:
             mid = req("POST", f"{self.g}/{self.id}/media_publish", data=form({"creation_id": cid, "access_token": self.t}), tag=self.tag)["id"]
         except AuthError: raise
@@ -158,21 +276,52 @@ class Instagram:
         link = req("GET", f"{self.g}/{mid}", {"fields": "permalink", "access_token": self.t}, tag=self.tag).get("permalink", "")
         return mid, link
 
+    def metrics(self, mid):
+        out = {}
+        try:
+            m = _req("GET", f"{self.g}/{mid}", {"fields": "like_count,comments_count", "access_token": self.t}, timeout=20)
+            out["likes"] = int(m.get("like_count") or 0)
+            out["comments"] = int(m.get("comments_count") or 0)
+        except Exception:
+            pass
+        for metric_list in ("views,saved,shares", "plays,saved,shares"):
+            try:
+                ins = _req("GET", f"{self.g}/{mid}/insights", {"metric": metric_list, "access_token": self.t}, timeout=20)
+                for d in ins.get("data", []):
+                    val = ((d.get("values") or [{}])[0]).get("value") or 0
+                    k = "views" if d.get("name") in ("views", "plays") else d.get("name")
+                    out[k] = int(val)
+                if "views" in out: break
+            except Exception:
+                continue
+        return out
+
 class Facebook:
     name, tag, kinds = "facebook", "FB", ("reel", "long")
     def __init__(self):
+        perm = core.get_key("facebook_page_token")
+        pid = core.get_key("facebook_page_id")
+        if perm and pid:
+            try:
+                pg = req("GET", f"{G_FB}/{pid}", {"fields": "id,name", "access_token": perm})
+                self.t, self.id, self.page = perm, pg["id"], pg["name"]
+                self.account = f"Page: {self.page}"
+                return
+            except AuthError:
+                core.del_key("facebook_page_token")
         t = core.get_key("facebook_token")
         if not t: raise RuntimeError("not connected")
-        pid = core.get_key("facebook_page_id")
         if pid:
             pg = req("GET", f"{G_FB}/{pid}", {"fields": "id,name,access_token", "access_token": t})
             if not pg.get("access_token"): raise RuntimeError("this key can't manage the Page " + pg.get("name", pid))
             self.t, self.id, self.page = pg["access_token"], pg["id"], pg["name"]
+            core.set_key("facebook_page_token", self.t)
         else:
             pages = req("GET", f"{G_FB}/me/accounts", {"fields": "id,name,access_token", "limit": 100, "access_token": t}).get("data", [])
             if len(pages) == 1:
                 self.t, self.id, self.page = pages[0]["access_token"], pages[0]["id"], pages[0]["name"]
                 core.set_key("facebook_page_id", self.id)
+                core.set_key("facebook_page_token", self.t)
             elif pages:
                 raise RuntimeError("this key manages several Pages; pick one in Accounts: " + ", ".join(p["name"] for p in pages))
             else:
@@ -245,14 +394,33 @@ class Facebook:
         self._wait(vid, 60)
         return vid, f"https://www.facebook.com/{self.id}/videos/{vid}"
 
+    def metrics(self, mid):
+        out = {}
+        try:
+            m = _req("GET", f"{G_FB}/{mid}", {"fields": "views,likes.summary(true),comments.summary(true)", "access_token": self.t}, timeout=20)
+            if m.get("views") is not None: out["views"] = int(m["views"])
+            out["likes"] = int(((m.get("likes") or {}).get("summary") or {}).get("total_count") or 0)
+            out["comments"] = int(((m.get("comments") or {}).get("summary") or {}).get("total_count") or 0)
+        except Exception:
+            pass
+        return out
+
 class VideoLink:
-    """Threads downloads videos by URL, so we serve the file from this Mac through a temporary Cloudflare link."""
-    def __init__(self, root):
+    """Self-healing, single-file scoped Cloudflare tunnel (never exposes HOME_DIR over HTTP)."""
+    def __init__(self):
+        self.stage_dir = os.path.join(core.DIRS["logs"], "_tunnel_stage_" + uuid.uuid4().hex[:12])
+        os.makedirs(self.stage_dir, exist_ok=True)
+        self.http = None
+        self.tun = None
+        self.base = None
+        self._open()
+
+    def _open(self):
+        self.close(keep_dir=True)
         cf = core.which("cloudflared")
-        if not cf: raise RuntimeError("cloudflared isn't installed (the installer adds it)")
-        self.root = root
+        if not cf: raise RuntimeError("cloudflared isn't installed (`brew install cloudflared`)")
         sck = socket.socket(); sck.bind(("127.0.0.1", 0)); port = sck.getsockname()[1]; sck.close()
-        self.http = subprocess.Popen([sys.executable, "-m", "http.server", str(port), "--bind", "127.0.0.1", "--directory", root],
+        self.http = subprocess.Popen([sys.executable, "-m", "http.server", str(port), "--bind", "127.0.0.1", "--directory", self.stage_dir],
                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.tun = subprocess.Popen([cf, "tunnel", "--no-autoupdate", "--url", f"http://127.0.0.1:{port}"],
                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -262,19 +430,38 @@ class VideoLink:
             if m: self.base = m.group(0); break
         if not self.base: raise RuntimeError("couldn't open the temporary video link (cloudflared)")
         threading.Thread(target=lambda: [None for _ in self.tun.stdout], daemon=True).start()
-        for _ in range(30):     # new links take a while to show up in local DNS; ask Cloudflare's DNS directly
+        probe_file = os.path.join(self.stage_dir, "_health.txt")
+        open(probe_file, "w").write("ok")
+        for _ in range(30):
             r = subprocess.run(["curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "10",
-                                "--doh-url", "https://1.1.1.1/dns-query", self.base + "/"], capture_output=True, text=True)
-            if r.stdout.strip() == "200": time.sleep(5); return
+                                "--doh-url", "https://1.1.1.1/dns-query", self.base + "/_health.txt"], capture_output=True, text=True)
+            if r.stdout.strip() == "200": time.sleep(2); return
             time.sleep(3)
 
-    def url(self, path):
-        return self.base + "/" + urllib.parse.quote(os.path.relpath(path, self.root).replace(os.sep, "/"))
+    def healthy(self):
+        if not self.base or not self.tun or self.tun.poll() is not None or not self.http or self.http.poll() is not None:
+            return False
+        r = subprocess.run(["curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "8",
+                            "--doh-url", "https://1.1.1.1/dns-query", self.base + "/_health.txt"], capture_output=True, text=True)
+        return r.stdout.strip() == "200"
 
-    def close(self):
+    def stage_url(self, src_path):
+        if not self.healthy():
+            core.say("TH", "Cloudflare video tunnel reconnecting…", "info")
+            self._open()
+        ext = os.path.splitext(src_path)[1].lower() or ".mp4"
+        tok = uuid.uuid4().hex + ext
+        dst = os.path.join(self.stage_dir, tok)
+        core.fast_copy(src_path, dst)
+        return self.base + "/" + tok, dst
+
+    def close(self, keep_dir=False):
         for pr in (self.tun, self.http):
-            try: pr.terminate()
-            except Exception: pass
+            if pr:
+                try: pr.terminate()
+                except Exception: pass
+        if not keep_dir and os.path.isdir(self.stage_dir):
+            shutil.rmtree(self.stage_dir, ignore_errors=True)
 
 class Threads:
     name, tag, kinds = "threads", "TH", ("reel",)
@@ -304,26 +491,45 @@ class Threads:
         return None
 
     def post(self, item):
-        if self.link is None: self.link = VideoLink(core.HOME_DIR)
-        c = req("POST", f"{G_TH}/{self.id}/threads", data=form({"media_type": "VIDEO", "video_url": self.link.url(item["file"]),
-                "text": item["captions"]["threads"][:500], "access_token": self.t}), tag=self.tag)
-        cid = c["id"]
-        for _ in range(20):
-            time.sleep(30)
-            st = req("GET", f"{G_TH}/{cid}", {"fields": "status,error_message", "access_token": self.t}, tag=self.tag)
-            if st.get("status") == "FINISHED": break
-            if st.get("status") in ("ERROR", "EXPIRED"): raise RuntimeError(f"processing failed: {st}")
-        else:
-            raise RuntimeError("still processing after 10 min")
+        if self.link is None: self.link = VideoLink()
+        pub_url, staged_path = self.link.stage_url(item["file"])
+        try:
+            c = req("POST", f"{G_TH}/{self.id}/threads", data=form({"media_type": "VIDEO", "video_url": pub_url,
+                    "text": item["captions"]["threads"][:500], "access_token": self.t}), tag=self.tag)
+            cid = c["id"]
+            for _ in range(20):
+                time.sleep(30)
+                st = req("GET", f"{G_TH}/{cid}", {"fields": "status,error_message", "access_token": self.t}, tag=self.tag)
+                if st.get("status") == "FINISHED": break
+                if st.get("status") in ("ERROR", "EXPIRED"): raise RuntimeError(f"processing failed: {st}")
+            else:
+                raise RuntimeError("still processing after 10 min")
+        finally:
+            try: os.remove(staged_path)
+            except OSError: pass
         mid = req("POST", f"{G_TH}/{self.id}/threads_publish", data=form({"creation_id": cid, "access_token": self.t}), tag=self.tag)["id"]
         try: link = req("GET", f"{G_TH}/{mid}", {"fields": "permalink", "access_token": self.t}, tag=self.tag).get("permalink", "")
         except RuntimeError: link = ""
         return mid, link
 
+    def metrics(self, mid):
+        out = {}
+        try:
+            ins = _req("GET", f"{G_TH}/{mid}/insights", {"metric": "views,likes,replies,reposts", "access_token": self.t}, timeout=20)
+            for d in ins.get("data", []):
+                val = d.get("total_value", {}).get("value")
+                if val is None and d.get("values"):
+                    val = d["values"][0].get("value")
+                if val is not None:
+                    k = "comments" if d.get("name") == "replies" else ("shares" if d.get("name") == "reposts" else d.get("name"))
+                    out[k] = int(val)
+        except Exception:
+            pass
+        return out
+
 CLIENTS = {"instagram": Instagram, "facebook": Facebook, "threads": Threads}
 
 def check(platform):
-    """For the Accounts screen: (ok, message)."""
     try:
         c = CLIENTS[platform]()
         return True, f"Connected as {c.account}"
@@ -332,17 +538,47 @@ def check(platform):
     except Exception as e:
         return False, str(e)[:300]
 
-# ---------------- the scheduler ----------------
+# ---------------- priority scheduler + stagger + jitter + insights ----------------
 RETRYABLE = ("upload rejected", "processing failed", "still processing")
+
+def item_priority(it):
+    p = int(it.get("priority") or round(float(it.get("score") or 5) * 10))
+    hr = datetime.datetime.now().hour
+    if it.get("tier") == "S" and (11 <= hr <= 14 or 18 <= hr <= 23):
+        p += 50
+    return p
 
 def _last_post_time(q, platform):
     times = [v.get("time", 0) for it in q for p, v in it["posted"].items() if p == platform and v.get("status") == "posted"]
     return max(times) if times else 0
 
-def _next_item(q, platform, kinds, alternate):
-    todo = [it for it in q if it["approved"] and it["kind"] in kinds and platform not in it["posted"]]
+def _catchup_item(q, platform, kinds, active_platforms):
+    """When sync_meta is True, if another active Meta platform already posted a video that `platform` hasn't posted yet, pick it immediately."""
+    partial = []
+    for it in q:
+        if not it.get("approved") or it["kind"] not in kinds or platform in it["posted"] or not os.path.isfile(it.get("file", "")):
+            continue
+        other_times = [
+            it["posted"][p].get("time", 0)
+            for p in active_platforms
+            if p != platform and it["posted"].get(p, {}).get("status") == "posted"
+        ]
+        if other_times:
+            partial.append((min(other_times), -item_priority(it), it))
+    if not partial:
+        return None
+    partial.sort(key=lambda x: (x[0], x[1]))
+    return partial[0][2]
+
+def _next_item(q, platform, kinds, alternate, sync_meta=False, active_platforms=()):
+    if sync_meta and active_platforms:
+        cu = _catchup_item(q, platform, kinds, active_platforms)
+        if cu:
+            return cu
+    todo = [it for it in q if it["approved"] and it["kind"] in kinds and platform not in it["posted"] and os.path.isfile(it.get("file", ""))]
     if not todo: return None
-    if alternate and len(kinds) > 1:
+    todo.sort(key=lambda it: (-item_priority(it), it.get("created", 0)))
+    if alternate and not sync_meta and len(kinds) > 1:
         done = sorted((v.get("time", 0), it["kind"]) for it in q for p, v in it["posted"].items() if p == platform and v.get("status") == "posted")
         last_kind = done[-1][1] if done else "long"
         want = "reel" if last_kind == "long" else "long"
@@ -355,23 +591,62 @@ def _mark(item_id, platform, **v):
         q = pipeline.queue()
         for it in q:
             if it["id"] == item_id:
-                it["posted"][platform] = dict(v, time=time.time())
+                prev_m = it["posted"].get(platform, {}).get("metrics")
+                entry = dict(v, time=time.time())
+                if prev_m and "metrics" not in entry:
+                    entry["metrics"] = prev_m
+                it["posted"][platform] = entry
         pipeline.save_queue(q)
 
 def _post_with_retries(client, item):
+    led = ledger_check(client.name, item.get("file"))
+    if led:
+        core.say(client.tag, f"already in SHA-256 ledger, skipping duplicate: {item['title'][:55]}"); return led
     line = first_line(item["captions"].get(client.name) or item["captions"].get("facebook", ""))
     live = client.find_live(line)
     if live:
-        core.say(client.tag, f"already live, skipping: {item['title'][:60]}"); return live
+        ledger_record(client.name, item.get("file"), live[0], live[1])
+        core.say(client.tag, f"already live on {client.tag}, skipping: {item['title'][:55]}"); return live
     waits = [120, 300, 600]
     for attempt in range(len(waits) + 1):
         try:
-            return client.post(item)
+            mid, url = client.post(item)
+            ledger_record(client.name, item.get("file"), mid, url)
+            return mid, url
         except AuthError: raise
         except RuntimeError as e:
             if attempt == len(waits) or not any(x in str(e) for x in RETRYABLE): raise
             core.say(client.tag, f"Meta refused the upload (try {attempt+1}); nothing was posted. Retrying in {waits[attempt]//60} min", "warn")
             _nap(client.tag, waits[attempt], "RETRYING")
+
+def refresh_insights(limit_per_platform=12):
+    """Fetch live views/likes/comments/shares from IG, FB & Threads for recent posts."""
+    q = pipeline.queue()
+    clients = {}
+    for p in CLIENTS:
+        if core.get_key({"instagram": "instagram_token", "facebook": "facebook_token", "threads": "threads_token"}[p]):
+            try: clients[p] = CLIENTS[p]()
+            except Exception: pass
+    if not clients:
+        return {"updated": 0}
+    updated = 0
+    for p, cl in clients.items():
+        if not hasattr(cl, "metrics"): continue
+        recent_items = sorted(
+            [it for it in q if it["posted"].get(p, {}).get("status") == "posted" and it["posted"][p].get("id")],
+            key=lambda it: it["posted"][p].get("time", 0), reverse=True,
+        )[:limit_per_platform]
+        for it in recent_items:
+            m = cl.metrics(it["posted"][p]["id"])
+            if m:
+                with _qlock:
+                    q_live = pipeline.queue()
+                    for x in q_live:
+                        if x["id"] == it["id"] and p in x["posted"]:
+                            x["posted"][p]["metrics"] = m
+                            updated += 1
+                    pipeline.save_queue(q_live)
+    return {"updated": updated}
 
 def run_platform(platform):
     tag = CLIENTS[platform].tag
@@ -383,6 +658,9 @@ def run_platform(platform):
         _state(tag, "NOT CONNECTED", kind="dead", note=str(e)[:200]); return
     _state(tag, "STARTING", kind="busy", account=client.account)
     core.say(tag, f"posting as {client.account}")
+
+    boot_stagger = int((core.load_settings().get("platform_stagger_min") or {}).get(platform, 0)) * 60
+    boot_at = time.time()
     fails = 0
     while not _stop.is_set():
         s = core.load_settings()
@@ -392,19 +670,51 @@ def run_platform(platform):
         if not (a <= datetime.datetime.now().hour < b):
             _nap(tag, 600, "OUTSIDE POSTING HOURS"); continue
         q = pipeline.queue()
-        gap = s["post_every_min"].get(platform, 60) * 60 - (time.time() - _last_post_time(q, platform))
-        if gap > 0:
-            _nap(tag, min(gap, 60), "NEXT POST"); STATUS[tag]["until"] = time.time() + max(0, gap - 60); continue
-        item = _next_item(q, platform, client.kinds, s.get("alternate_long", True))
+        sync_meta = bool(s.get("sync_meta", True))
+        active_plats = [
+            p for p, k in (("instagram", "instagram_token"), ("facebook", "facebook_token"), ("threads", "threads_token"))
+            if s["platforms_on"].get(p, True) and core.get_key(k)
+        ]
+        catchup = _catchup_item(q, platform, client.kinds, active_plats) if sync_meta else None
+        last_t = _last_post_time(q, platform)
+        if catchup is not None:
+            gap = 0
+            item = catchup
+        elif sync_meta and active_plats:
+            leader = active_plats[0]
+            iv = max(300, s["post_every_min"].get(leader, 30) * 60)
+            plat_lasts = [_last_post_time(q, p) for p in active_plats]
+            batch_last = max(plat_lasts) if any(plat_lasts) else 0
+            any_pending_catchup = any(_catchup_item(q, p, CLIENTS[p].kinds, active_plats) is not None for p in active_plats)
+            if platform != leader or any_pending_catchup:
+                wait_for = max(10, (batch_last + iv) - time.time()) if batch_last else 10
+                _nap(tag, min(wait_for, 10), "NEXT POST", total_until=wait_for); continue
+            gap = (batch_last + iv) - time.time() if batch_last else 0
+            if gap > 0:
+                _nap(tag, min(gap, 15), "NEXT POST", total_until=gap); continue
+            item = _next_item(q, platform, client.kinds, False, sync_meta=True, active_platforms=active_plats)
+        else:
+            if platform not in _next_jitter:
+                jm = max(0, int(s.get("jitter_min", 0)))
+                _next_jitter[platform] = random.randint(-jm * 60, jm * 60) if jm else 0
+            if last_t == 0 and boot_stagger > 0:
+                gap = (boot_at + boot_stagger) - time.time()
+            else:
+                base_iv = max(300, s["post_every_min"].get(platform, 60) * 60 + _next_jitter[platform])
+                gap = (last_t + base_iv) - time.time() if last_t else 0
+            if gap > 0:
+                _nap(tag, min(gap, 15), "NEXT POST", total_until=gap); continue
+            item = _next_item(q, platform, client.kinds, s.get("alternate_long", False))
         if not item:
             _nap(tag, 120, "WAITING FOR APPROVED VIDEOS"); continue
         try:
             if not client.room_today():
                 _nap(tag, 1800, "DAILY LIMIT REACHED"); continue
             _state(tag, f"POSTING: {item['title'][:40]}", kind="busy")
-            core.say(tag, f"posting: {item['title'][:80]}")
+            core.say(tag, f"posting [{item.get('tier','A')}]: {item['title'][:75]}")
             pid, url = _post_with_retries(client, item)
             _mark(item["id"], platform, status="posted", id=pid, url=url)
+            _next_jitter.pop(platform, None)
             core.say(tag, f"posted: {url}", "good")
             fails = 0
         except AuthError:
@@ -422,13 +732,15 @@ _threads = {}
 
 def start_all():
     _stop.clear()
-    threading.Thread(target=_daily, daemon=True).start()
+    if not getattr(start_all, "_maint", False):
+        start_all._maint = True
+        threading.Thread(target=_daily, daemon=True).start()
     for p in CLIENTS:
         if p in _threads and _threads[p].is_alive(): continue
         if not core.load_settings()["platforms_on"].get(p, True): continue
         t = threading.Thread(target=run_platform, args=(p,), daemon=True); t.start(); _threads[p] = t
     if shutil.which("caffeinate") and not getattr(start_all, "_awake", None):
-        start_all._awake = subprocess.Popen(["caffeinate", "-i", "-w", str(os.getpid())])   # keep the Mac awake while posting
+        start_all._awake = subprocess.Popen(["caffeinate", "-i", "-w", str(os.getpid())])
 
 def stop_all():
     _stop.set()
@@ -439,10 +751,12 @@ def running():
 def _daily():
     while not _stop.is_set():
         threads_refresh()
-        _stop.wait(86400)
+        instagram_refresh()
+        try: refresh_insights()
+        except Exception: pass
+        _stop.wait(7200)
 
 def retry(item_id, platform):
-    """User pressed 'try again' on a failed post."""
     with _qlock:
         q = pipeline.queue()
         for it in q:

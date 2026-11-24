@@ -4,7 +4,45 @@ python -m factory --terminal    terminal dashboard (the web app keeps running to
 python -m factory add <link|file>   hand a video to a running factory
 python -m factory status            one-line summary from a running factory
 """
-import json, os, shutil, sys, threading, time, urllib.request, webbrowser
+import json, os, shutil, socket, sys, threading, time, urllib.request, webbrowser
+
+def _port_free(port):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        return s.connect_ex(("127.0.0.1", port)) != 0
+
+def _is_gvcf(port):
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/state", timeout=1.5) as r:
+            d = json.load(r)
+            return isinstance(d, dict) and "queue_size" in d and "posting" in d
+    except Exception:
+        return False
+
+def _pick_port(for_cli=False):
+    if os.environ.get("GVCF_PORT"):
+        return int(os.environ["GVCF_PORT"])
+    from . import core
+    pf = os.path.join(core.HOME_DIR, ".port")
+    if for_cli:
+        try:
+            saved = int(open(pf).read().strip())
+            if _is_gvcf(saved):
+                return saved
+        except Exception:
+            pass
+        for p in range(8765, 8776):
+            if _is_gvcf(p):
+                return p
+        return 8765
+    for p in range(8765, 8776):
+        if _port_free(p):
+            try:
+                core.ensure_dirs()
+                open(pf, "w").write(str(p))
+            except OSError:
+                pass
+            return p
+    return 8765
 
 PORT = int(os.environ.get("GVCF_PORT", "8765"))
 URL = f"http://localhost:{PORT}"
@@ -21,6 +59,9 @@ def _call(path, body=None):
 def cli(args):
     cmd = args[0]
     try:
+        if cmd == "monitor":
+            from . import tui
+            return tui.run(URL, remote=True)
         if cmd == "status":
             s = _call("/api/state")
             on = any(s["posting"]["running"].values())
@@ -42,9 +83,19 @@ def cli(args):
 
 
 def main():
+    global PORT, URL
     args = sys.argv[1:]
     if args and not args[0].startswith("-"):
+        PORT = _pick_port(for_cli=True)
+        URL = f"http://localhost:{PORT}"
         return cli(args)
+    if "--terminal" in args:
+        existing_p = _pick_port(for_cli=True)
+        if _is_gvcf(existing_p):
+            from . import tui
+            return tui.run(f"http://localhost:{existing_p}", remote=True)
+    PORT = _pick_port(for_cli=False)
+    URL = f"http://localhost:{PORT}"
     from . import server, core
     s = core.load_settings()
     mode = "terminal" if "--terminal" in args else "web" if "--web" in args else (s.get("launch_mode") or "web")
